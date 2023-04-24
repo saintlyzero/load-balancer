@@ -13,7 +13,7 @@ MEMORY_LIMIT = "140m" # memory ligit of each container
 SERVER_PORT = 5000 # container exposed port
 LB_PORT_START = 9000 # load-balancer port to bind with container
 FAST_API_PORT = 8000 
-INITIAL_NODE_COUNT = 3 # number of containers of load-balancers to start with
+INITIAL_NODE_COUNT = 10 # number of containers of load-balancers to start with
 HEALTH_CHECK_TIME = 10  # seconds to wait before executing health-check
 
 
@@ -50,25 +50,26 @@ class Node:
 
 
 class LoadBalancer:
-    def __init__(self, node_count: int) -> None:
-        self.node_count = node_count
+    def __init__(self) -> None:
         self.nodes: List[Node] = []
         self.client = docker.from_env()
+        self.last_used_port = LB_PORT_START
 
-    def start_nodes(self):
+    def add_nodes(self, node_count:int):
         """Start all nodes on different ports
         """
-        for i in range(self.node_count):
-            node = Node(self.client, LB_PORT_START+i)
+        for _ in range(node_count):
+            node = Node(self.client, self.last_used_port)
+            self.last_used_port += 1
             node.power_on()
             self.nodes.append(node)
 
-    def delete_nodes(self):
-        """Delete all nodes from the load-balancer.
-        """
-        print("--Deleteing nodes--")
-        for node in self.nodes:
+    def delete_nodes(self, node_count:int):
+        while node_count and self.nodes:
+            node = self.nodes.pop()
+            self.last_used_port -= 1
             node.power_off()
+            node_count -= 1
 
     def health_check(self):
         """Run health-check for all the nodes
@@ -77,16 +78,14 @@ class LoadBalancer:
             print(f"Node {itr} : {node.get_memory_usage()}")
 
 
-lb = LoadBalancer(INITIAL_NODE_COUNT)
+lb = LoadBalancer()
 app = FastAPI(title="Load Balancer")
-
-
 
 
 @app.on_event("startup")
 async def startup_event():
     print("Starting nodes")
-    lb.start_nodes()
+    lb.add_nodes(INITIAL_NODE_COUNT)
 
 
 @app.on_event("startup")
@@ -99,13 +98,15 @@ def health_check() -> None:
 @app.on_event("shutdown")
 def shutdown_event():
     print("Shutting down nodes")
-    lb.delete_nodes()
+    node_count = len(lb.nodes)
+    lb.delete_nodes(node_count)
 
 
 @app.get("/api")
-async def get_api():
-    response = requests.get(f'http://localhost:{LB_PORT_START}/')
-    return response.content.decode()
+async def get_api(num: int = 2):
+    # response = requests.get(f'http://localhost:{LB_PORT_START}/')
+    # return response.content.decode()
+    return f"Square of {num} = {num**2}"
 
 
 
