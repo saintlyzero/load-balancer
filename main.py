@@ -8,14 +8,22 @@ from docker.client import DockerClient
 from fastapi import FastAPI
 from fastapi_utils.tasks import repeat_every
 
+# load balancer
 IMAGE_NAME = "flask_docker"
 MEMORY_LIMIT = "140m" # memory ligit of each container
 SERVER_PORT = 5000 # container exposed port
 LB_PORT_START = 9000 # load-balancer port to bind with container
 FAST_API_PORT = 8000 
-INITIAL_NODE_COUNT = 10 # number of containers of load-balancers to start with
+INITIAL_NODE_COUNT = 3 # number of containers of load-balancers to start with
 HEALTH_CHECK_TIME = 10  # seconds to wait before executing health-check
 
+# auto-scaling
+MAX_NODES = 10
+MIN_NODES = 2
+MAX_MEMORY_USAGE_THRESHOLD = 70 # memory usage threshold in percentage to scale up
+MIN_MEMORY_USAGE_THRESHOLD = 30 # memory usage threshold in percentage to scale down   
+SCALE_UP_NODE_COUNT = 2
+SCALE_DOWN_NODE_COUNT = 2
 
 class Node:
     """Represent a server node in the load-balancer
@@ -49,6 +57,7 @@ class Node:
         return (memory_used / memory_limit) * 100
 
 
+
 class LoadBalancer:
     def __init__(self) -> None:
         self.nodes: List[Node] = []
@@ -71,12 +80,43 @@ class LoadBalancer:
             node.power_off()
             node_count -= 1
 
+    def get_node_count(self) -> int:
+        return len(self.nodes)
+
     def health_check(self):
         """Run health-check for all the nodes
         """
-        for itr, node in enumerate(self.nodes):
-            print(f"Node {itr} : {node.get_memory_usage()}")
 
+        memory_utilization = []
+        for itr, node in enumerate(self.nodes):
+            memory_utilized = node.get_memory_usage()
+            memory_utilization.append(memory_utilized)
+            print(f"Node {itr} : {memory_utilized}")
+
+        # scale up
+        if all(_memory > MAX_MEMORY_USAGE_THRESHOLD for _memory in memory_utilization):
+            self.scale_up()
+
+        # scale down
+        elif all(_memory < MIN_MEMORY_USAGE_THRESHOLD for _memory in memory_utilization):
+            self.scale_down()
+
+
+    def scale_up(self):
+        if self.get_node_count() + SCALE_UP_NODE_COUNT >= MAX_NODES:
+            print(f"Maximum node count of {MAX_NODES} reached. Cannot add more nodes")
+        else:
+            print(f"Memory utilization of all nodes is over {MAX_MEMORY_USAGE_THRESHOLD}%")
+            print(f"Auto Scaler: Adding {SCALE_UP_NODE_COUNT} nodes")
+            self.add_nodes(SCALE_UP_NODE_COUNT)
+            
+    def scale_down(self):
+        if self.get_node_count() - SCALE_DOWN_NODE_COUNT < MIN_NODES:
+            print(f"Minimum node count of {MIN_NODES} reached. Cannot delete nodes")
+        else:
+            print(f"Memory utilization of all nodes is below {MIN_MEMORY_USAGE_THRESHOLD}%")
+            print(f"Auto Scaler: Deleting {SCALE_DOWN_NODE_COUNT} nodes")
+            self.delete_nodes(SCALE_DOWN_NODE_COUNT)
 
 lb = LoadBalancer()
 app = FastAPI(title="Load Balancer")
@@ -98,7 +138,7 @@ def health_check() -> None:
 @app.on_event("shutdown")
 def shutdown_event():
     print("Shutting down nodes")
-    node_count = len(lb.nodes)
+    node_count = lb.get_node_count()
     lb.delete_nodes(node_count)
 
 
