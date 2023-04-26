@@ -13,7 +13,7 @@ IMAGE_NAME = "flask_docker"
 MEMORY_LIMIT = "140m" # memory ligit of each container
 SERVER_PORT = 5000 # container exposed port
 LB_PORT_START = 9000 # load-balancer port to bind with container
-FAST_API_PORT = 8000 
+FAST_API_PORT = 8001 
 INITIAL_NODE_COUNT = 3 # number of containers of load-balancers to start with
 HEALTH_CHECK_TIME = 10  # seconds to wait before executing health-check
 
@@ -21,7 +21,7 @@ HEALTH_CHECK_TIME = 10  # seconds to wait before executing health-check
 MAX_NODES = 10
 MIN_NODES = 2
 MAX_MEMORY_USAGE_THRESHOLD = 70 # memory usage threshold in percentage to scale up
-MIN_MEMORY_USAGE_THRESHOLD = 30 # memory usage threshold in percentage to scale down   
+MIN_MEMORY_USAGE_THRESHOLD = 20 # memory usage threshold in percentage to scale down   
 SCALE_UP_NODE_COUNT = 2
 SCALE_DOWN_NODE_COUNT = 2
 
@@ -32,6 +32,7 @@ class Node:
         self.client = client
         self.host_port = host_port
         self.container: Container = None
+        self.memory_used: float = None
 
     def power_on(self):
         """Start a docker container in detached mode
@@ -55,7 +56,10 @@ class Node:
         memory_used = stats['memory_stats']['usage']
         memory_limit = stats['memory_stats']['limit']
         return (memory_used / memory_limit) * 100
+    
 
+    def get_name(self) -> str:
+        return self.container.id[:8]
 
 
 class LoadBalancer:
@@ -63,6 +67,8 @@ class LoadBalancer:
         self.nodes: List[Node] = []
         self.client = docker.from_env()
         self.last_used_port = LB_PORT_START
+        self.min_node: Node = None
+        
 
     def add_nodes(self, node_count:int):
         """Start all nodes on different ports
@@ -88,10 +94,19 @@ class LoadBalancer:
         """
 
         memory_utilization = []
-        for itr, node in enumerate(self.nodes):
+        min_node = self.nodes[0]
+        for node in self.nodes:
             memory_utilized = node.get_memory_usage()
             memory_utilization.append(memory_utilized)
-            print(f"Node {itr} : {memory_utilized}")
+            node.memory_used = memory_utilized
+            print(f"Node {node.get_name()} | Memory Utilization: {memory_utilized}")
+
+            # select node with least memory used
+            if min_node.memory_used >= node.memory_used:
+                min_node = node
+
+        self.min_node = min_node
+        print(f"Min node: {min_node.get_name()} | Memory: {min_node.memory_used}")
 
         # scale up
         if all(_memory > MAX_MEMORY_USAGE_THRESHOLD for _memory in memory_utilization):
@@ -143,10 +158,12 @@ def shutdown_event():
 
 
 @app.get("/api")
-async def get_api(num: int = 2):
-    # response = requests.get(f'http://localhost:{LB_PORT_START}/')
-    # return response.content.decode()
-    return f"Square of {num} = {num**2}"
+async def get_api():
+    
+    node = lb.min_node
+    port = node.host_port
+    response = requests.get(f'http://localhost:{port}/')
+    return response.content.decode()
 
 
 
