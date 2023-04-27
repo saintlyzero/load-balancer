@@ -7,7 +7,7 @@
     - `pip install -r requirements.txt`
 - Create Docker image
     - Go to `app` folder where the `Dockerfile` is located
-    - Build image: `docker image build -t flask_docker .`
+    - Build image: `docker image build -t heavy_task .`
 
 # Execute
 - Run FastAPI server `python main.py`

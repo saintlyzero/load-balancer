@@ -1,29 +1,40 @@
 import docker
 import uvicorn
-import requests
+import httpx
 
+from httpx import ConnectError, ConnectTimeout
+ 
 from typing import List
 from docker.models.containers import Container
 from docker.client import DockerClient
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi_utils.tasks import repeat_every
 
 # load balancer
-IMAGE_NAME = "flask_docker"
-MEMORY_LIMIT = "140m" # memory ligit of each container
+IMAGE_NAME = "heavy_task"
+MEMORY_LIMIT = "280m" # memory ligit of each container
 SERVER_PORT = 5000 # container exposed port
 LB_PORT_START = 9000 # load-balancer port to bind with container
-FAST_API_PORT = 8001 
-INITIAL_NODE_COUNT = 3 # number of containers of load-balancers to start with
-HEALTH_CHECK_TIME = 10  # seconds to wait before executing health-check
+FAST_API_PORT = 8000 
+INITIAL_NODE_COUNT = 1 # number of containers of load-balancers to start with
+HEALTH_CHECK_TIME = 1  # seconds to wait before executing health-check
 
 # auto-scaling
 MAX_NODES = 10
-MIN_NODES = 2
+MIN_NODES = 1
 MAX_MEMORY_USAGE_THRESHOLD = 70 # memory usage threshold in percentage to scale up
 MIN_MEMORY_USAGE_THRESHOLD = 20 # memory usage threshold in percentage to scale down   
 SCALE_UP_NODE_COUNT = 2
-SCALE_DOWN_NODE_COUNT = 2
+SCALE_DOWN_NODE_COUNT = 1
+
+timeout = httpx.Timeout(5.0, read=5.0)
+
+async def get_client():
+    # create a new client for each request
+    async with httpx.AsyncClient() as client:
+        # yield the client to the endpoint function
+        yield client
+        # close the client when the request is done
 
 class Node:
     """Represent a server node in the load-balancer
@@ -56,7 +67,6 @@ class Node:
         memory_used = stats['memory_stats']['usage']
         memory_limit = stats['memory_stats']['limit']
         return (memory_used / memory_limit) * 100
-    
 
     def get_name(self) -> str:
         return self.container.id[:8]
@@ -88,33 +98,48 @@ class LoadBalancer:
 
     def get_node_count(self) -> int:
         return len(self.nodes)
+    
+    def handle_failure(self, container:str):
+        active_nodes = []
+        for node in self.nodes:
+            if node.container == container:
+                node.power_off()
+            else:
+                active_nodes.append(node)
+            
+        self.nodes = active_nodes
+        self.add_nodes(1)
+        self.min_node = active_nodes[0]
+        return
 
     def health_check(self):
         """Run health-check for all the nodes
         """
+        try:
+            memory_utilization = []
+            min_node = self.nodes[0]
+            for node in self.nodes:
+                memory_utilized = node.get_memory_usage()
+                memory_utilization.append(memory_utilized)
+                node.memory_used = memory_utilized
+                print(f"Node {node.get_name()} | Memory Utilization: {memory_utilized}")
 
-        memory_utilization = []
-        min_node = self.nodes[0]
-        for node in self.nodes:
-            memory_utilized = node.get_memory_usage()
-            memory_utilization.append(memory_utilized)
-            node.memory_used = memory_utilized
-            print(f"Node {node.get_name()} | Memory Utilization: {memory_utilized}")
+                # select node with least memory used
+                if min_node.memory_used >= node.memory_used:
+                    min_node = node
 
-            # select node with least memory used
-            if min_node.memory_used >= node.memory_used:
-                min_node = node
+            self.min_node = min_node
+            print(f"Min node: {min_node.get_name()} | Memory: {min_node.memory_used}")
 
-        self.min_node = min_node
-        print(f"Min node: {min_node.get_name()} | Memory: {min_node.memory_used}")
+            # scale up
+            if all(_memory > MAX_MEMORY_USAGE_THRESHOLD for _memory in memory_utilization):
+                self.scale_up()
 
-        # scale up
-        if all(_memory > MAX_MEMORY_USAGE_THRESHOLD for _memory in memory_utilization):
-            self.scale_up()
-
-        # scale down
-        elif all(_memory < MIN_MEMORY_USAGE_THRESHOLD for _memory in memory_utilization):
-            self.scale_down()
+            # scale down
+            elif all(_memory < MIN_MEMORY_USAGE_THRESHOLD for _memory in memory_utilization):
+                self.scale_down()
+        except Exception as e:
+            print(f"***** Health-Check Exc {repr(e)}")
 
 
     def scale_up(self):
@@ -146,8 +171,9 @@ async def startup_event():
 @app.on_event("startup")
 @repeat_every(seconds=HEALTH_CHECK_TIME)
 def health_check() -> None:
-    print("starting health check")
+    print("\n---Starting health check---")
     lb.health_check()
+    print("---------------------------------------------------------------\n")
 
 
 @app.on_event("shutdown")
@@ -158,14 +184,21 @@ def shutdown_event():
 
 
 @app.get("/api")
-async def get_api():
-    
+async def get_api(client: httpx.AsyncClient = Depends(get_client)):
     node = lb.min_node
     port = node.host_port
-    response = requests.get(f'http://localhost:{port}/')
-    return response.content.decode()
-
-
-
+    try:
+        response = await client.get(f'http://localhost:{port}/', timeout=timeout)
+        return response.content.decode()
+    except (ConnectError, ConnectTimeout) as e:
+        print(f"*********Faliure: Node {node.get_name()}\nStarting new node")
+        lb.handle_failure(node.container)
+        print("handled failure ")
+        res = await get_api(client)
+        print("handled retry request :)")
+        return res
+    except Exception as e:
+        return "ReadTimeout"
+        
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=FAST_API_PORT, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=FAST_API_PORT, reload=True, log_level="info")
