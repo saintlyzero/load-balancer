@@ -27,6 +27,11 @@ MIN_MEMORY_USAGE_THRESHOLD = 20 # memory usage threshold in percentage to scale 
 SCALE_UP_NODE_COUNT = 2
 SCALE_DOWN_NODE_COUNT = 1
 
+SYMBOL_NODE_FAILURE = "⛔"
+SYMBOL_NODE_SCALE_UP = "🔶"
+SYMBOL_NODE_SCALE_DOWN = "🔻"
+SYMBOL_NODE_FAILURE_DETECTED ="🚩"
+
 timeout = httpx.Timeout(5.0, read=5.0)
 
 async def get_client():
@@ -117,19 +122,43 @@ class LoadBalancer:
         """
         try:
             memory_utilization = []
-            min_node = self.nodes[0]
+            active_nodes = []
+            failed_nodes = [] 
+            min_node, max_node = self.nodes[0], self.nodes[0]
             for node in self.nodes:
-                memory_utilized = node.get_memory_usage()
-                memory_utilization.append(memory_utilized)
-                node.memory_used = memory_utilized
-                print(f"Node {node.get_name()} | Memory Utilization: {memory_utilized}")
+                try:
+                    memory_utilized = node.get_memory_usage()
+                    memory_utilization.append(memory_utilized)
+                    node.memory_used = memory_utilized
+                    # print(f"Node {node.get_name()} | Memory Utilization: {memory_utilized}")
 
-                # select node with least memory used
-                if min_node.memory_used >= node.memory_used:
-                    min_node = node
-
+                    # select node with least memory used
+                    if min_node.memory_used >= node.memory_used:
+                        min_node = node
+                        
+                    if max_node.memory_used <= node.memory_used:
+                        max_node = node
+                        
+                    active_nodes.append(node)
+                except KeyError:
+                    failed_nodes.append(node)
+                
+            # remove failed nodes    
+            if failed_nodes:
+                print(f"   Detected {len(failed_nodes)} Failed Nodes in Health check {SYMBOL_NODE_FAILURE_DETECTED}")
+            
+            for node in failed_nodes:
+                node.power_off()
+            
+                
+            # replace failed nodes
+            self.nodes = active_nodes
+            self.add_nodes(len(failed_nodes))
+                
+            
+            print(f"   Active Nodes: {self.get_node_count()}")
             self.min_node = min_node
-            print(f"Min node: {min_node.get_name()} | Memory: {min_node.memory_used}")
+            print(f"   Scheduled Node: {min_node.get_name()} \n   Min Memory: {min_node.memory_used:0.3f}% | Max Memory: {max_node.memory_used:0.3f}%")
 
             # scale up
             if all(_memory > MAX_MEMORY_USAGE_THRESHOLD for _memory in memory_utilization):
@@ -139,23 +168,23 @@ class LoadBalancer:
             elif all(_memory < MIN_MEMORY_USAGE_THRESHOLD for _memory in memory_utilization):
                 self.scale_down()
         except Exception as e:
-            print(f"***** Health-Check Exc {repr(e)}")
+            print(f"   Health-Check Exception {repr(e)}")
 
 
     def scale_up(self):
         if self.get_node_count() + SCALE_UP_NODE_COUNT >= MAX_NODES:
-            print(f"Maximum node count of {MAX_NODES} reached. Cannot add more nodes")
+            print(f"   Maximum node count of {MAX_NODES} reached.\n   Cannot add more nodes")
         else:
-            print(f"Memory utilization of all nodes is over {MAX_MEMORY_USAGE_THRESHOLD}%")
-            print(f"Auto Scaler: Adding {SCALE_UP_NODE_COUNT} nodes")
+            print(f"   Memory utilization of all nodes is over {MAX_MEMORY_USAGE_THRESHOLD}%")
+            print(f"        AUTO SCALER: Adding {SCALE_UP_NODE_COUNT} nodes {SYMBOL_NODE_SCALE_UP}")
             self.add_nodes(SCALE_UP_NODE_COUNT)
             
     def scale_down(self):
         if self.get_node_count() - SCALE_DOWN_NODE_COUNT < MIN_NODES:
-            print(f"Minimum node count of {MIN_NODES} reached. Cannot delete nodes")
+            print(f"   Minimum node threshold {MIN_NODES} reached.\n   Cannot delete nodes")
         else:
-            print(f"Memory utilization of all nodes is below {MIN_MEMORY_USAGE_THRESHOLD}%")
-            print(f"Auto Scaler: Deleting {SCALE_DOWN_NODE_COUNT} nodes")
+            print(f"   Memory utilization of all nodes is below {MIN_MEMORY_USAGE_THRESHOLD}%")
+            print(f"        AUTO SCALER: Deleting {SCALE_DOWN_NODE_COUNT} nodes {SYMBOL_NODE_SCALE_DOWN}")
             self.delete_nodes(SCALE_DOWN_NODE_COUNT)
 
 lb = LoadBalancer()
@@ -171,9 +200,9 @@ async def startup_event():
 @app.on_event("startup")
 @repeat_every(seconds=HEALTH_CHECK_TIME)
 def health_check() -> None:
-    print("\n---Starting health check---")
+    print("\n|--------------------- HEALTH CHECK ---------------------|")
     lb.health_check()
-    print("---------------------------------------------------------------\n")
+    print("|--------------------- ------------ ---------------------|\n")
 
 
 @app.on_event("shutdown")
@@ -188,17 +217,18 @@ async def get_api(client: httpx.AsyncClient = Depends(get_client)):
     node = lb.min_node
     port = node.host_port
     try:
-        response = await client.get(f'http://localhost:{port}/', timeout=timeout)
+        # response = await client.get(f'http://localhost:{port}/', timeout=timeout)
+        response = await client.get(f'http://localhost:{port}/')
         return response.content.decode()
     except (ConnectError, ConnectTimeout) as e:
-        print(f"*********Faliure: Node {node.get_name()}\nStarting new node")
+        print(f"\n     **{SYMBOL_NODE_FAILURE}NODE FAILURE {node.get_name()}**")
         lb.handle_failure(node.container)
-        print("handled failure ")
+        print("     **Replaced failed node**")
         res = await get_api(client)
-        print("handled retry request :)")
+        print("      **Retried Failed Node Request**\n")
         return res
     except Exception as e:
         return "ReadTimeout"
         
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=FAST_API_PORT, reload=True, log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=FAST_API_PORT, reload=True, log_level="critical")
